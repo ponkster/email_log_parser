@@ -1,0 +1,12 @@
+/target
+
+# CSV data files
+*.csv
+
+# macOS system files
+.DS_Store
+
+# Environment configuration files
+.env
+.env.local
+.env.*.local
