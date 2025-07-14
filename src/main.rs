@@ -6,13 +6,119 @@ use std::env;
 use csv::WriterBuilder;
 use encoding_rs::*;
 use dotenv::dotenv;
+use grep_searcher::{Searcher, SearcherBuilder};
+use grep_matcher::LineTerminator;
+use grep_regex::RegexMatcher;
+use regex::RegexBuilder;
+use std::io::Cursor;
+
+// Custom matcher for ripgrep-style filtering
+struct EmailFilter {
+    exclude_domains: Vec<String>,
+    max_email_length: usize,
+    exclude_patterns: Vec<regex::Regex>,
+}
+
+impl EmailFilter {
+    fn new(exclude_domains: Vec<String>) -> Result<Self, Box<dyn Error>> {
+        // Compile regex patterns for unwanted content
+        let exclude_patterns = vec![
+            RegexBuilder::new(r"SendEmail-PreprocessPayload")
+                .case_insensitive(true)
+                .build()?,
+            RegexBuilder::new(r"\.OUTLOOK\.COM>")
+                .case_insensitive(true)
+                .build()?,
+            RegexBuilder::new(r"@odspnotify")
+                .case_insensitive(true)
+                .build()?,
+            // Pattern for extremely long system-generated emails
+            RegexBuilder::new(r"[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}")
+                .case_insensitive(true)
+                .build()?,
+        ];
+
+        Ok(EmailFilter {
+            exclude_domains,
+            max_email_length: 60, // Reasonable business email length
+            exclude_patterns,
+        })
+    }
+
+    fn should_exclude_line(&self, line: &str) -> bool {
+        // Use ripgrep-style pattern matching to quickly exclude lines
+        for pattern in &self.exclude_patterns {
+            if pattern.is_match(line) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn should_exclude_email(&self, email: &str) -> bool {
+        // Quick length check
+        if email.len() > self.max_email_length {
+            return true;
+        }
+
+        // Check domain exclusions
+        for domain in &self.exclude_domains {
+            if email.ends_with(domain) {
+                return true;
+            }
+        }
+
+        // Additional pattern checks for system emails
+        for pattern in &self.exclude_patterns {
+            if pattern.is_match(email) {
+                return true;
+            }
+        }
+
+        false
+    }
+}
+
+// Custom searcher sink to collect matching lines
+struct LineCollector {
+    lines: Vec<String>,
+    filter: EmailFilter,
+}
+
+impl LineCollector {
+    fn new(filter: EmailFilter) -> Self {
+        LineCollector {
+            lines: Vec::new(),
+            filter,
+        }
+    }
+}
+
+impl grep_searcher::Sink for LineCollector {
+    type Error = Box<dyn Error>;
+
+    fn matched(
+        &mut self,
+        _searcher: &Searcher,
+        mat: &grep_searcher::SinkMatch<'_>,
+    ) -> Result<bool, Self::Error> {
+        let line = std::str::from_utf8(mat.bytes())?;
+        
+        // Apply ripgrep-style filtering
+        if !self.filter.should_exclude_line(line) {
+            self.lines.push(line.to_string());
+        }
+        
+        Ok(true) // Continue searching
+    }
+}
 
 fn main() -> Result<(), Box<dyn Error>> {
     // Load environment variables from .env file
     dotenv().ok();
     
     // Get configurable exclusion domains from environment variable
-    let exclusion_domains_str = env::var("EXCLUSION_DOMAINS").unwrap_or_else(|_| "@mycompany.com".to_string());
+    let exclusion_domains_str = env::var("EXCLUSION_DOMAINS").unwrap_or_else(|_| "@ycp.com".to_string());
     let exclusion_domains: Vec<String> = exclusion_domains_str
         .split(',')
         .map(|s| s.trim().to_string())
@@ -27,7 +133,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         eprintln!("Usage: {} <input_file.csv> [output_file.csv]", args[0]);
         eprintln!("Examples:");
         eprintln!("  {} input.csv", args[0]);
-        eprintln!("  {} report2.csv filtered_emails.csv", args[0]);
+        eprintln!("  {} report2.csv mtsummary_output.csv", args[0]);
         std::process::exit(1);
     }
     
@@ -35,7 +141,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let output_file = if args.len() >= 3 {
         &args[2]
     } else {
-        "filtered_emails.csv"
+        "mtsummary_output.csv"
     };
     
     println!("Processing: {} -> {}", input_file, output_file);
@@ -83,13 +189,55 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
         }
     };
+
+    // Debug: Show first few lines to understand the format
+    let debug_lines: Vec<&str> = content.lines().take(3).collect();
+    println!("Debug - First 3 lines of decoded content:");
+    for (i, line) in debug_lines.iter().enumerate() {
+        println!("Line {}: {}", i, &line[..std::cmp::min(line.len(), 100)]);
+    }
+
+    // Initialize ripgrep-style filtering
+    let email_filter = EmailFilter::new(exclusion_domains.clone())?;
     
-    // Skip CSV reader and parse manually due to embedded line breaks
+    // Use ripgrep to pre-filter content for performance
+    // Pattern to match lines starting with timestamps (data lines)
+    let timestamp_matcher = RegexMatcher::new_line_matcher(r#"^"202[0-9]"#)?;
+    
+    let mut searcher = SearcherBuilder::new()
+        .line_number(false)
+        .line_terminator(LineTerminator::byte(b'\n'))
+        .build();
+    
+    let mut line_collector = LineCollector::new(email_filter);
+    
+    // Search for timestamp lines and collect them
+    // Convert to UTF-8 bytes for ripgrep processing
+    let utf8_content = content.as_bytes();
+    let cursor = Cursor::new(utf8_content);
+    searcher.search_reader(&timestamp_matcher, cursor, &mut line_collector)?;
+    
+    println!("Ripgrep pre-filtering found {} potential data lines", line_collector.lines.len());
+    
+    // Fallback: if ripgrep didn't find anything, parse manually
+    let lines_to_process = if line_collector.lines.is_empty() {
+        println!("Ripgrep found no matches, falling back to manual line filtering");
+        content.lines()
+            .skip(1) // Skip header
+            .filter(|line| line.trim().starts_with("\"202"))
+            .map(|s| s.to_string())
+            .collect()
+    } else {
+        line_collector.lines
+    };
+    
+    println!("Processing {} data lines", lines_to_process.len());
+    
+    // Now process the filtered lines
     let mut processed_count = 0;
     let mut seen_recipients = HashSet::new();
     let mut successful_records = 0;
     let mut error_count = 0;
-    let mut total_lines = 0;
     
     // Prepare CSV writer
     let output = File::create(output_file)?;
@@ -105,117 +253,93 @@ fn main() -> Result<(), Box<dyn Error>> {
         "message_subject",
     ])?;
     
-    // Split content into lines and manually parse
-    let lines: Vec<&str> = content.lines().collect();
-    let mut i = 1; // Skip header line
-    
-    while i < lines.len() {
-        total_lines += 1;
+    // Process the filtered lines
+    for (line_num, line) in lines_to_process.iter().enumerate() {
+        // Extract fields manually using basic parsing
+        let parts: Vec<&str> = line.split("\",\"").collect();
         
-        // Look for complete records by finding timestamp pattern
-        let line = lines[i].trim();
-        
-        // Skip empty lines
-        if line.is_empty() {
-            i += 1;
-            continue;
-        }
-        
-        // Look for lines starting with timestamp pattern "2025-
-        if line.starts_with("\"2025-") {
-            // Extract fields manually using basic parsing
-            let parts: Vec<&str> = line.split("\",\"").collect();
+        if parts.len() >= 6 {
+            // Clean up the fields by removing quotes
+            let timestamp = parts[0].trim_start_matches('"');
+            let sender = parts[1];
+            let recipient_status = parts[2];
+            let subject = parts.get(3).map_or("", |v| v);
             
-            if parts.len() >= 6 {
-                // Clean up the fields by removing quotes
-                let timestamp = parts[0].trim_start_matches('"');
-                let sender = parts[1];
-                let recipient_status = parts[2];
-                let subject = parts.get(3).map_or("", |v| v);
-                // Message ID might be in different positions due to embedded commas
-                let mut message_id = "";
-                for part in &parts {
-                    if part.starts_with('<') && part.contains('@') {
-                        message_id = part.trim_end_matches('"');
-                        break;
-                    }
+            // Find message ID (look for email-like pattern in angle brackets)
+            let mut message_id = "";
+            for part in &parts {
+                if part.starts_with('<') && part.contains('@') {
+                    message_id = part.trim_end_matches('"');
+                    break;
                 }
-                
-                // Only process emails from the configured exclusion domains senders
-                if !exclusion_domains.iter().any(|domain| sender.ends_with(domain)) {
-                    i += 1;
-                    continue;
-                }
-                
-                successful_records += 1;
+            }
+            
+            // Only process emails from the configured exclusion domains senders
+            if !exclusion_domains.iter().any(|domain| sender.ends_with(domain)) {
+                continue;
+            }
+            
+            successful_records += 1;
 
-                // Parse recipient_status to extract individual email addresses
-                // Format: "email##status;email##status;..." (semicolon-separated, with some comma-separated status info)
-                let recipients: Vec<&str> = recipient_status
-                    .split(';')
-                    .filter_map(|recipient_entry| {
-                        // Split by "##" to separate email from status
-                        let email = recipient_entry.split("##").next().unwrap_or("").trim();
-                        // Remove any leading/trailing quotes and clean up
-                        let clean_email = email.trim_matches('"').trim();
-                        
-                        // Only include valid emails that:
-                        // 1. Contain @ symbol
-                        // 2. Do NOT have the configured exclusion domain 
-                        // 3. Do NOT end with .OUTLOOK.COM>
-                        // 4. Are not excessively long (typical business emails are under 60 chars)
-                        // 5. Do not contain system-generated keywords
-                        if clean_email.contains("@") && 
-                           !exclusion_domains.iter().any(|domain| clean_email.ends_with(domain)) && 
-                           !clean_email.ends_with(".OUTLOOK.COM>") &&
-                           clean_email.len() <= 60 &&
-                           !clean_email.contains("SendEmail") &&
-                           !clean_email.contains("PreprocessPayload") {
+            // Parse recipient_status to extract individual email addresses
+            // Format: "email##status;email##status;..." (semicolon-separated)
+            let recipients: Vec<&str> = recipient_status
+                .split(';')
+                .filter_map(|recipient_entry| {
+                    // Split by "##" to separate email from status
+                    let email = recipient_entry.split("##").next().unwrap_or("").trim();
+                    // Remove any leading/trailing quotes and clean up
+                    let clean_email = email.trim_matches('"').trim();
+                    
+                    // Use ripgrep-style filtering for valid emails
+                    if clean_email.contains("@") {
+                        // Apply email filter
+                        let filter = EmailFilter::new(exclusion_domains.clone()).unwrap();
+                        if !filter.should_exclude_email(clean_email) {
                             Some(clean_email)
                         } else {
                             None
                         }
-                    })
-                    .collect();
-
-                // Write unique recipients to output
-                for recipient in recipients {
-                    if seen_recipients.insert(recipient.to_string()) {
-                        wtr.write_record([
-                            timestamp,
-                            message_id,
-                            sender,
-                            recipient,
-                            subject,
-                        ])?;
-                        processed_count += 1;
+                    } else {
+                        None
                     }
-                }
-            } else {
-                error_count += 1;
-                if error_count <= 10 {  // Only show first 10 errors
-                    println!("Error parsing line {}: Insufficient fields", total_lines);
+                })
+                .collect();
+
+            // Write unique recipients to output
+            for recipient in recipients {
+                if seen_recipients.insert(recipient.to_string()) {
+                    wtr.write_record([
+                        timestamp,
+                        message_id,
+                        sender,
+                        recipient,
+                        subject,
+                    ])?;
+                    processed_count += 1;
                 }
             }
         } else {
-            // Skip non-data lines (could be continuation lines)
+            error_count += 1;
+            if error_count <= 10 {  // Only show first 10 errors
+                println!("Error parsing line {}: Insufficient fields", line_num + 1);
+            }
         }
         
-        // Show progress every 1000 records
-        if total_lines % 1000 == 0 {
+        // Show progress every 100 records for processed data
+        if (line_num + 1) % 100 == 0 {
             println!("Processed {} lines, {} successful records, {} unique recipients", 
-                     total_lines, successful_records, processed_count);
+                     line_num + 1, successful_records, processed_count);
         }
-        
-        i += 1;
     }
 
     wtr.flush()?;
 
-    println!("Processing complete!");
-    println!("Total lines processed: {}", total_lines);
+    println!("Ripgrep-optimized processing complete!");
+    println!("Data lines processed: {}", lines_to_process.len());
     println!("Total encoding/parse errors: {}", error_count);
     println!("Successful records: {}", successful_records);
-    println!("Unique clean business emails found (excluding {}, Exchange IDs, and long system emails): {}", exclusion_domains.join(", "), processed_count);
+    println!("Unique clean business emails found (excluding {}, system emails, and long addresses): {}", 
+             exclusion_domains.join(", "), processed_count);
     Ok(())
 }
