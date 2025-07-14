@@ -3,11 +3,14 @@ use std::error::Error;
 use std::fs::File;
 use std::io::Read;
 use std::env;
+use std::time::Instant;
 use csv::WriterBuilder;
 use encoding_rs::*;
 use dotenv::dotenv;
 
 fn main() -> Result<(), Box<dyn Error>> {
+    let start_time = Instant::now();
+    
     // Load environment variables from .env file
     dotenv().ok();
     
@@ -40,7 +43,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     
     println!("Processing: {} -> {}", input_file, output_file);
 
-    // Read file with encoding handling
+    // Phase 1: File Reading and Encoding Detection
+    let file_read_start = Instant::now();
     let mut file = File::open(input_file)?;
     let mut buffer = Vec::new();
     file.read_to_end(&mut buffer)?;
@@ -83,8 +87,23 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
         }
     };
+
+    let file_read_duration = file_read_start.elapsed();
+    println!("⏱️  File reading and encoding: {:.2}ms", file_read_duration.as_millis());
     
-    // Skip CSV reader and parse manually due to embedded line breaks
+    // Phase 2: Line Parsing and Pre-processing
+    let line_parsing_start = Instant::now();
+    
+    // Split content into lines and manually parse
+    let lines: Vec<&str> = content.lines().collect();
+    let total_input_lines = lines.len();
+    
+    let line_parsing_duration = line_parsing_start.elapsed();
+    println!("⏱️  Line parsing and setup: {:.2}ms", line_parsing_duration.as_millis());
+    
+    // Phase 3: Data Processing and Filtering (Main Processing Loop)
+    let processing_start = Instant::now();
+    
     let mut processed_count = 0;
     let mut seen_recipients = HashSet::new();
     let mut successful_records = 0;
@@ -105,8 +124,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         "message_subject",
     ])?;
     
-    // Split content into lines and manually parse
-    let lines: Vec<&str> = content.lines().collect();
     let mut i = 1; // Skip header line
     
     while i < lines.len() {
@@ -201,8 +218,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             // Skip non-data lines (could be continuation lines)
         }
         
-        // Show progress every 1000 records
-        if total_lines % 1000 == 0 {
+        // Show progress every 500 records (less frequent for performance)
+        if total_lines % 500 == 0 {
             println!("Processed {} lines, {} successful records, {} unique recipients", 
                      total_lines, successful_records, processed_count);
         }
@@ -211,9 +228,31 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     wtr.flush()?;
+    let processing_duration = processing_start.elapsed();
+    
+    // Total time calculation
+    let total_duration = start_time.elapsed();
 
-    println!("Processing complete!");
-    println!("Total lines processed: {}", total_lines);
+    // Performance summary
+    println!("\n📊 PERFORMANCE SUMMARY (NON-RIPGREP VERSION)");
+    println!("=============================================");
+    println!("⏱️  File reading & encoding: {:.2}ms ({:.1}%)", 
+             file_read_duration.as_millis(),
+             (file_read_duration.as_millis() as f64 / total_duration.as_millis() as f64) * 100.0);
+    println!("⏱️  Line parsing & setup:    {:.2}ms ({:.1}%)", 
+             line_parsing_duration.as_millis(),
+             (line_parsing_duration.as_millis() as f64 / total_duration.as_millis() as f64) * 100.0);
+    println!("⏱️  Data processing:         {:.2}ms ({:.1}%)", 
+             processing_duration.as_millis(),
+             (processing_duration.as_millis() as f64 / total_duration.as_millis() as f64) * 100.0);
+    println!("⏱️  TOTAL PROCESSING TIME:   {:.2}ms", total_duration.as_millis());
+    println!("📈 Processing rate:          {:.0} records/second", 
+             total_lines as f64 / total_duration.as_secs_f64());
+
+    println!("\n✅ RESULTS SUMMARY");
+    println!("==================");
+    println!("Total input lines: {}", total_input_lines);
+    println!("Data lines processed: {}", total_lines);
     println!("Total encoding/parse errors: {}", error_count);
     println!("Successful records: {}", successful_records);
     println!("Unique clean business emails found (excluding {}, Exchange IDs, and long system emails): {}", exclusion_domains.join(", "), processed_count);
