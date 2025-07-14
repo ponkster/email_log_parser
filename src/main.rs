@@ -3,6 +3,7 @@ use std::error::Error;
 use std::fs::File;
 use std::io::Read;
 use std::env;
+use std::time::Instant;
 use csv::WriterBuilder;
 use encoding_rs::*;
 use dotenv::dotenv;
@@ -114,6 +115,8 @@ impl grep_searcher::Sink for LineCollector {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
+    let start_time = Instant::now();
+    
     // Load environment variables from .env file
     dotenv().ok();
     
@@ -146,7 +149,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     
     println!("Processing: {} -> {}", input_file, output_file);
 
-    // Read file with encoding handling
+    // Phase 1: File Reading and Encoding Detection
+    let file_read_start = Instant::now();
     let mut file = File::open(input_file)?;
     let mut buffer = Vec::new();
     file.read_to_end(&mut buffer)?;
@@ -190,6 +194,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     };
 
+    let file_read_duration = file_read_start.elapsed();
+    println!("⏱️  File reading and encoding: {:.2}ms", file_read_duration.as_millis());
+
     // Debug: Show first few lines to understand the format
     let debug_lines: Vec<&str> = content.lines().take(3).collect();
     println!("Debug - First 3 lines of decoded content:");
@@ -197,6 +204,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         println!("Line {}: {}", i, &line[..std::cmp::min(line.len(), 100)]);
     }
 
+    // Phase 2: Ripgrep Pre-filtering
+    let ripgrep_start = Instant::now();
+    
     // Initialize ripgrep-style filtering
     let email_filter = EmailFilter::new(exclusion_domains.clone())?;
     
@@ -217,9 +227,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     let cursor = Cursor::new(utf8_content);
     searcher.search_reader(&timestamp_matcher, cursor, &mut line_collector)?;
     
+    let ripgrep_duration = ripgrep_start.elapsed();
+    println!("⏱️  Ripgrep pre-filtering: {:.2}ms", ripgrep_duration.as_millis());
     println!("Ripgrep pre-filtering found {} potential data lines", line_collector.lines.len());
     
     // Fallback: if ripgrep didn't find anything, parse manually
+    let fallback_start = Instant::now();
     let lines_to_process = if line_collector.lines.is_empty() {
         println!("Ripgrep found no matches, falling back to manual line filtering");
         content.lines()
@@ -230,10 +243,17 @@ fn main() -> Result<(), Box<dyn Error>> {
     } else {
         line_collector.lines
     };
+    let fallback_duration = fallback_start.elapsed();
+    
+    if fallback_duration.as_millis() > 0 {
+        println!("⏱️  Fallback filtering: {:.2}ms", fallback_duration.as_millis());
+    }
     
     println!("Processing {} data lines", lines_to_process.len());
     
-    // Now process the filtered lines
+    // Phase 3: Data Processing and Output Generation
+    let processing_start = Instant::now();
+    
     let mut processed_count = 0;
     let mut seen_recipients = HashSet::new();
     let mut successful_records = 0;
@@ -326,16 +346,42 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
         }
         
-        // Show progress every 100 records for processed data
-        if (line_num + 1) % 100 == 0 {
+        // Show progress every 500 records for processed data (less frequent for performance)
+        if (line_num + 1) % 500 == 0 {
             println!("Processed {} lines, {} successful records, {} unique recipients", 
                      line_num + 1, successful_records, processed_count);
         }
     }
 
     wtr.flush()?;
+    let processing_duration = processing_start.elapsed();
+    
+    // Total time calculation
+    let total_duration = start_time.elapsed();
 
-    println!("Ripgrep-optimized processing complete!");
+    // Performance summary
+    println!("\n📊 PERFORMANCE SUMMARY");
+    println!("========================");
+    println!("⏱️  File reading & encoding: {:.2}ms ({:.1}%)", 
+             file_read_duration.as_millis(),
+             (file_read_duration.as_millis() as f64 / total_duration.as_millis() as f64) * 100.0);
+    println!("⏱️  Ripgrep pre-filtering:   {:.2}ms ({:.1}%)", 
+             ripgrep_duration.as_millis(),
+             (ripgrep_duration.as_millis() as f64 / total_duration.as_millis() as f64) * 100.0);
+    if fallback_duration.as_millis() > 0 {
+        println!("⏱️  Fallback filtering:      {:.2}ms ({:.1}%)", 
+                 fallback_duration.as_millis(),
+                 (fallback_duration.as_millis() as f64 / total_duration.as_millis() as f64) * 100.0);
+    }
+    println!("⏱️  Data processing:         {:.2}ms ({:.1}%)", 
+             processing_duration.as_millis(),
+             (processing_duration.as_millis() as f64 / total_duration.as_millis() as f64) * 100.0);
+    println!("⏱️  TOTAL PROCESSING TIME:   {:.2}ms", total_duration.as_millis());
+    println!("📈 Processing rate:          {:.0} records/second", 
+             lines_to_process.len() as f64 / total_duration.as_secs_f64());
+
+    println!("\n✅ RESULTS SUMMARY");
+    println!("==================");
     println!("Data lines processed: {}", lines_to_process.len());
     println!("Total encoding/parse errors: {}", error_count);
     println!("Successful records: {}", successful_records);
